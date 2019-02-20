@@ -17,39 +17,53 @@ package main
 import (
 	"log"
 	"net/http"
-	"time"
+	"os"
 
+	"go.opencensus.io/exporter/zipkin"
 	"go.opencensus.io/plugin/ochttp"
 	"go.opencensus.io/trace"
 
-	"go.opencensus.io/examples/exporter"
-	"go.opencensus.io/stats/view"
+	openzipkin "github.com/openzipkin/zipkin-go"
+	zipkinHTTP "github.com/openzipkin/zipkin-go/reporter/http"
 )
 
-const server = "http://localhost:50030"
-
 func main() {
-	// Register stats and trace exporters to export the collected data.
-	exporter := &exporter.PrintExporter{}
-	view.RegisterExporter(exporter)
-	trace.RegisterExporter(exporter)
+	serviceName := "client"
+	server := os.Getenv("SERVER_URI")
+	if server == "" {
+		server = "http://localhost:8888"
+	}
 
-	// Always trace for this demo. In a production application, you should
-	// configure this to a trace.ProbabilitySampler set at the desired
-	// probability.
+	// Setup tracing
+	// reporterURI: zipkin reporter URI
+	reporterURI := os.Getenv("REPORTER_URI")
+	if reporterURI == "" {
+		reporterURI = "http://localhost:9411/api/v2/spans"
+	}
+
+	localEndpoint, err := openzipkin.NewEndpoint(serviceName, ":0")
+	if err != nil {
+		log.Fatalf("Failed to create Zipkin localEndpoint with URI %q error: %v", serviceName, err)
+	}
+
+	reporter := zipkinHTTP.NewReporter(reporterURI)
+	ze := zipkin.NewExporter(reporter, localEndpoint)
+
+	// And now finally register it as a Trace Exporter
+	trace.RegisterExporter(ze)
+
+	//TODO: Switch to trace.ProbabilitySampler if needed
 	trace.ApplyConfig(trace.Config{DefaultSampler: trace.AlwaysSample()})
-
-	// Report stats at every second.
-	view.SetReportingPeriod(1 * time.Second)
 
 	client := &http.Client{Transport: &ochttp.Transport{}}
 
-	resp, err := client.Get(server)
-	if err != nil {
-		log.Printf("Failed to get response: %v", err)
-	} else {
-		resp.Body.Close()
+	for i := 0; i < 100000; i++ {
+		resp, err := client.Get(server)
+		if err != nil {
+			log.Printf("Failed to get response: %v", err)
+		} else {
+			resp.Body.Close()
+		}
 	}
 
-	time.Sleep(2 * time.Second) // Wait until stats are reported.
 }
