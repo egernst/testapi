@@ -20,15 +20,22 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"time"
 
 	"go.opencensus.io/exporter/prometheus"
 	"go.opencensus.io/exporter/zipkin"
 	"go.opencensus.io/plugin/ochttp"
+	"go.opencensus.io/stats"
 	"go.opencensus.io/stats/view"
 	"go.opencensus.io/trace"
 
 	openzipkin "github.com/openzipkin/zipkin-go"
 	zipkinHTTP "github.com/openzipkin/zipkin-go/reporter/http"
+)
+
+var (
+	// Report latency seen by this server on the downstream call
+	mLatencyUs = stats.Float64("latency", "The downstream latency in microseconds", "ms")
 )
 
 func main() {
@@ -88,7 +95,27 @@ func main() {
 
 	// register it as a stats exporter.
 	view.RegisterExporter(pe)
+	// Report stats at every second.
+	view.SetReportingPeriod(1 * time.Second)
 
+	latencyView := &view.View{
+		Name:        serviceName + "/latency",
+		Measure:     mLatencyUs,
+		Description: "The distribution of the latencies",
+		Aggregation: view.Distribution(0, 100, 500, 600, 700, 800, 900, 1000),
+	}
+
+	/*
+		if err := view.Register(ochttp.DefaultServerViews...); err != nil {
+			log.Fatalf("Failed to register metrics view: %v", err)
+		}
+	*/
+
+	if err := view.Register(latencyView); err != nil {
+		log.Fatalf("Failed to register metrics view: %v", err)
+	}
+
+	//Start the metrics server on the user specified port
 	go func() {
 		mux := http.NewServeMux()
 		mux.Handle("/metrics", pe)
@@ -100,6 +127,7 @@ func main() {
 	// Run the actual workload
 	client := &http.Client{Transport: &ochttp.Transport{}}
 	http.HandleFunc("/", func(w http.ResponseWriter, req *http.Request) {
+		startTime := time.Now()
 		fmt.Fprintf(w, "hello:%s", serviceName)
 
 		if downstreamURI != "" {
@@ -113,7 +141,12 @@ func main() {
 
 			// Propagate the trace header info in the outgoing requests.
 			r = r.WithContext(req.Context())
+
+			startTime := time.Now()
 			resp, err := client.Do(r)
+			t := float64(time.Since(startTime).Nanoseconds()) / 1e3
+			stats.Record(req.Context(), mLatencyUs.M(t))
+
 			if err != nil {
 				log.Println(err)
 			} else {
@@ -122,6 +155,10 @@ func main() {
 				}
 				resp.Body.Close()
 			}
+		} else {
+			//This is time to work
+			t := float64(time.Since(startTime).Nanoseconds()) / 1e3
+			stats.Record(req.Context(), mLatencyUs.M(t))
 		}
 	})
 	log.Fatal("Server", http.ListenAndServe(upstreamURI, &ochttp.Handler{}))

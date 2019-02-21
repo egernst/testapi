@@ -57,7 +57,7 @@ func main() {
 
 	client := &http.Client{Transport: &ochttp.Transport{}}
 
-	for i := 0; i < 100000; i++ {
+	for i := 0; i < 1000; i++ {
 		resp, err := client.Get(server)
 		if err != nil {
 			log.Printf("Failed to get response: %v", err)
