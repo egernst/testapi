@@ -4,21 +4,35 @@ The goal of this framework is to easily model and measure the impact of workload
 
 > Note: The current implementation only supports a simple linear chain. However the goal is to support any directed acyclic graph.
 
+The framework attempts to use available latency isolation features like tasksets and Kubernetes guaranteed QoS Class to get more deterministic behavior.
+
 # How to run
 
-The interacting microservices can be launched as processes, containers or on Kubernetes. This can also be run directly in custom manner across a cluster of nodes with a service chain of any desired length and topology by setting the environment variables to the proper values prior to launching each micro service. The framework uses [stress-ng](http://manpages.ubuntu.com/manpages/xenial/man1/stress-ng.1.html) to generate load in response to a service request. This allows the service to model common workload profiles.
+The interacting microservices can be launched as processes, containers or deployments in Kubernetes. They can also be run directly in custom manner across a cluster of nodes with a service chain of any desired length and topology by setting appropriate environment variables. The framework provides multiple built in workloads. It also includes leveraging an external workload generator [stress-ng](http://manpages.ubuntu.com/manpages/xenial/man1/stress-ng.1.html) to generate configurable synthetic load in response to a service request. This allows the services to model common workload profiles.
 
 ## Environment variables
 
 - SERVICE_NAME: Name of the service as it will appear in traces and metrics.
-- UPSTREAM_URI: URI which the service exposes
-- DOWNSTREAM_URI: URI to which the service makes downstream requests to. If not set, this is the last service in the chain (i.e. terminating service).
+- UPSTREAM_URI: Base URI which the service exposes
+- DOWNSTREAM_URI: Base URI to which the service makes downstream requests to. If not set, this is the last service in the chain (i.e. terminating service).
 - REPORTER_URI: URI of the zipkin trace collector
-- PROFILE: stress-ng [job profile](https://github.com/ColinIanKing/stress-ng/tree/master/example-jobs) to simulate workload. This profile will be run when the service sees a request. The content of this file can be changed at runtime and the services will pick up the updated job profile.
+- PRIME_MAX: The upper bound for the prime search when using the built in prime generator workload
+- GOGC=off: To disable the golang garbage collector to reduce any variability induced by the golang runtime
+- JOBFILE: stress-ng [job profile](https://github.com/ColinIanKing/stress-ng/tree/master/example-jobs) to simulate workload. This profile will be run when the service sees a request. The content of this file can be changed at runtime and the services will pick up the updated job profile.
 
 These environment variables can be used to stitch processes or containers across machines.
 
 The sample deployments below use a service chain of length 3, root->branch->leaf as an illustration. 
+
+## Exposed workload URIs
+
+The services expose multiple URI's each of which performs different types of work. The current set includes
+- `/` : This does no work. It only forwards the request down the chain and allows us to determine the cost of Networking and HTTP handling
+- `/busywork`: Performs 10ms of CPU busywork prior to forwarding the request down the chain. This helps baseline the accuracy of the scheduler.
+- `/prime`: Computes all primes from `0` to `PRIME_MAX` using the [go implementation of Segmented Sieve](https://github.com/kavehmz/prime). On completion of computation it forwarding the request down the chain This should be constant time CPU and Memory intensive computation. However in the real world this has not proven to be quite true.
+- `/fork`: Forks a child `date` process. This baselines the cost of forking.
+- `/stress-ng`: Forks a `stress-ng` process with the `JOBFILE` as the input profile. This can be used to model most workloads. `stress-ng` itself launches multiple processes to spin up each type of work. Hence the additional fork from golang does not really impact the latency variation.
+
 
 ### stress-ng profile
 
@@ -57,85 +71,217 @@ stress-ng: info:  [11806] af-alg                3      0.01      0.00      0.00 
 
 ## Running as processes/containers directly on your host
 
-### Running as processes
+### Running as processes or containers on single system
+
+The framework allows you to run the workload directly without kubernetes. The set of scripts under `./http/server` helps you understand how this can be achieved.
+
+`./http/server/run_all.sh` will run the full gamut of scenarios
+- processes interacting with one another
+- containers interacting with one another (without container network isolation)
+- containers interacting with one another over a container network
+
+This helps you baseline the behavior of the system on that particular hardware and operating system.
+The `hey` reported metrics are available at `./http/server/latency_all.log`
+
+For example on a particular system under test
+
+**Baseline http performance**
+Shows a very tight 2 ms response range
 ```
-export SERVER_URI=http://localhost:8888
-cd ./http/server
-./run_chain.sh
+hello:broot:/:hello:bbranch:/:hello:bleaf:/
+Response time histogram:
+  0.000 [1]     |
+  0.001 [427]   |■■■■
+  0.001 [406]   |■■■■
+  0.001 [381]   |■■■■
+  0.001 [1311]  |■■■■■■■■■■■■■■
+  0.002 [3815]  |■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■
+  0.002 [1045]  |■■■■■■■■■■■
+  0.002 [5]     |
+  0.002 [0]     |
+  0.002 [1]     |
+  0.003 [1]     |
 ```
 
-### Running as containers on your host
 
+**Baseline scheduler**
+Also shows only 2ms range, which is within the baseline http
 ```
-export SERVER_URI=http://192.168.211.4:888
-cd ./http/server
-./run_container_chain.sh
+hello:broot:/busywork:hello:bbranch:/busywork:hello:bleaf:/busywork
+Response time histogram:
+  0.031 [1]     |
+  0.032 [8]     |■■
+  0.032 [16]    |■■■■
+  0.032 [11]    |■■■
+  0.032 [80]    |■■■■■■■■■■■■■■■■■■■
+  0.032 [171]   |■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■
+  0.032 [22]    |■■■■■
+  0.033 [3]     |■
+  0.033 [0]     |
+  0.033 [0]     |
+  0.033 [1]     |
 ```
+
+**Baseline prime computation**
+Shows a 5ms range. Which is higher than expected. 
+```
+hello:broot:/prime:hello:bbranch:/prime:hello:bleaf:/prime
+Response time histogram:
+  0.015 [1]     |
+  0.015 [13]    |■■■■
+  0.016 [81]    |■■■■■■■■■■■■■■■■■■■■■■■■■■■■
+  0.016 [99]    |■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■
+  0.017 [116]   |■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■
+  0.017 [103]   |■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■
+  0.018 [79]    |■■■■■■■■■■■■■■■■■■■■■■■■■■■
+  0.018 [57]    |■■■■■■■■■■■■■■■■■■■■
+  0.019 [22]    |■■■■■■■■
+  0.019 [12]    |■■■■
+  0.020 [7]     |■■
+```
+
+**Running as containers**
+Shows a larger spread of 11ms.
+```
+hello:lroot:/prime:hello:lbranch:/prime:hello:lleaf:/prime
+Response time histogram:
+  0.018 [1]     |■
+  0.019 [18]    |■■■■■■■■■
+  0.020 [21]    |■■■■■■■■■■■
+  0.021 [55]    |■■■■■■■■■■■■■■■■■■■■■■■■■■■■
+  0.022 [79]    |■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■
+  0.023 [66]    |■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■
+  0.024 [75]    |■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■
+  0.025 [67]    |■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■
+  0.026 [33]    |■■■■■■■■■■■■■■■■■
+  0.027 [16]    |■■■■■■■■
+  0.029 [7]     |■■■■
+```
+**Running as containers with networking**
+Shows a the same spread.
+```
+hello:croot:/prime:hello:cbranch:/prime:hello:cleaf:/prime
+Response time histogram:
+  0.018 [1]     |■
+  0.019 [24]    |■■■■■■■■■■■■■
+  0.020 [30]    |■■■■■■■■■■■■■■■■
+  0.021 [58]    |■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■
+  0.022 [63]    |■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■
+  0.023 [68]    |■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■
+  0.024 [75]    |■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■
+  0.025 [50]    |■■■■■■■■■■■■■■■■■■■■■■■■■■■
+  0.026 [43]    |■■■■■■■■■■■■■■■■■■■■■■■
+  0.028 [15]    |■■■■■■■■
+  0.029 [8]     |■■■■
+  ```
+
+Also a point to note would be that the baseline scheduler still performs as expected
+```
+hello:croot:/busywork:hello:cbranch:/busywork:hello:cleaf:/busywork
+Response time histogram:
+  0.032 [1]     |
+  0.032 [53]    |■■■■■■■■■■■■■
+  0.032 [160]   |■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■
+  0.032 [87]    |■■■■■■■■■■■■■■■■■■■■■■
+  0.033 [6]     |■■
+  0.033 [2]     |■
+  0.033 [0]     |
+  0.033 [0]     |
+  0.033 [0]     |
+  0.033 [0]     |
+  0.034 [1]     |
+```
+
+Now that the baseline has been established this workload can be run in kubernetes to evaluate the impact of different types of networking plugins, service mesh technologies and service meshes to the latency spread.
+
+A output from a vargant VM cluster based kubernetes can be seen here. You will see a higher degree of variation which may be contibuted by the VM layer or Kubernetes itself.
+
+**Kubernetes baseline**
+```
+hello:root:/:hello:branch:/:hello:leaf:/
+Response time histogram:
+  0.001 [1]     |
+  0.002 [92]    |■■■
+  0.003 [286]   |■■■■■■■■
+  0.003 [854]   |■■■■■■■■■■■■■■■■■■■■■■■■
+  0.004 [1410]  |■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■
+  0.005 [266]   |■■■■■■■■
+  0.006 [10]    |
+  0.006 [2]     |
+  0.007 [0]     |
+  0.008 [1]     |
+  0.009 [1]     |
+
+hello:root:/busywork:hello:branch:/busywork:hello:leaf:/busywork
+Response time histogram:
+  0.034 [1]     |
+  0.034 [110]   |■■■■■■■■■■■■■■■■■■■■■■■■■■■■
+  0.035 [155]   |■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■
+  0.036 [15]    |■■■■
+  0.036 [2]     |■
+  0.037 [2]     |■
+  0.038 [1]     |
+  0.038 [0]     |
+  0.039 [0]     |
+  0.040 [0]     |
+  0.040 [3]     |■
+```
+
+**Kubernetes prime computation**
+```
+hello:root:/prime:hello:branch:/prime:hello:leaf:/prime
+Response time histogram:
+  0.052 [1]     |■
+  0.057 [3]     |■■■
+  0.061 [6]     |■■■■■■■
+  0.066 [15]    |■■■■■■■■■■■■■■■■■
+  0.070 [30]    |■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■
+  0.074 [36]    |■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■
+  0.079 [19]    |■■■■■■■■■■■■■■■■■■■■■
+  0.083 [14]    |■■■■■■■■■■■■■■■■
+  0.088 [11]    |■■■■■■■■■■■■
+  0.092 [3]     |■■■
+  0.097 [1]     |■
+```
+
+
 
 ### Traces and metrics
-- The traces are available at http://localhost:9411
-- The metrics are available at http://localhost:9090
+
+Traces and metrics helps you root cause the source of variability. The metrics are available at each service. The traces are available across the whole service chain. The traces have been setup with a probability sampler to reduce the framework overhead. But the traces still help root cause variations as the latency variations are typically visible within the samples.
+
+- The traces are available at http://192.168.211.2:9411
+- The metrics are available at http://192.168.211.3:9090
 - Grafana is available to http://localhost:3000
+
+You can also query the metrics directly from the individual service.
+
+For example in the case of processes running directly on the host you can query then at
+```
+curl localhost:8885/metrics
+curl localhost:8886/metrics
+curl localhost:8887/metrics
+```
 
 ### Load generation
 
-> Note: Ensure that the SERVER_URI environment variable is setup properly.
+> Note: Ensure that the SERVER_URI environment variable is setup properly to reflect the test
 
 #### Using hey 
 ```
 go get -u github.com/rakyll/hey
-while true; do hey -c 1 -z 10s -disable-keepalive $SERVER_URI; done
+
+# Reusing the HTTP connection for all requests
+hey -c 1 -z 10s $SERVER_URI
+
+# If you want to include HTTP connections setup time (which adds a lot of variation)
+hey -c 1 -z 10s -disable-keepalive $SERVER_URI
 ```
 
-hey will report client visible latency, which can then be broken down using the prometheus exported metrics and zipkin traces.
+hey will report client visible latency, which can then be broken down using the prometheus exported metrics and zipkin traces. You can change the concurrency via `-c` and the runlength via `-z`.
 
 A sample output of hey in a kubernetes cluster can be seen below. This shows the latency spread. The fastest response times are in line with stress-ng profile and the overhead of traversing the network stack.
 
-```
-Summary:
-  Total:        10.0825 secs
-  Slowest:      0.1962 secs
-  Fastest:      0.1579 secs
-  Average:      0.1768 secs
-  Requests/sec: 5.6534
-
-  Total data:   1938 bytes
-  Size/request: 34 bytes
-
-Response time histogram:
-  0.158 [1]     |■■■■
-  0.162 [1]     |■■■■
-  0.166 [4]     |■■■■■■■■■■■■■■■
-  0.169 [5]     |■■■■■■■■■■■■■■■■■■
-  0.173 [8]     |■■■■■■■■■■■■■■■■■■■■■■■■■■■■■
-  0.177 [8]     |■■■■■■■■■■■■■■■■■■■■■■■■■■■■■
-  0.181 [11]    |■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■
-  0.185 [9]     |■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■
-  0.189 [5]     |■■■■■■■■■■■■■■■■■■
-  0.192 [3]     |■■■■■■■■■■■
-  0.196 [2]     |■■■■■■■
-
-
-Latency distribution:
-  10% in 0.1662 secs
-  25% in 0.1705 secs
-  50% in 0.1775 secs
-  75% in 0.1824 secs
-  90% in 0.1891 secs
-  95% in 0.1937 secs
-  0% in 0.0000 secs
-
-Details (average, fastest, slowest):
-  DNS+dialup:   0.0005 secs, 0.1579 secs, 0.1962 secs
-  DNS-lookup:   0.0000 secs, 0.0000 secs, 0.0000 secs
-  req write:    0.0001 secs, 0.0001 secs, 0.0003 secs
-  resp wait:    0.1759 secs, 0.1573 secs, 0.1952 secs
-  resp read:    0.0002 secs, 0.0001 secs, 0.0003 secs
-
-Status code distribution:
-  [200] 57 responses
-
-```
 
 #### Alternately using the builtin client
 ```
@@ -148,7 +294,74 @@ while true; do COUNT=1000 ./client ; done
 
 # Visualizing the latency
 
+## Individual traces
+
+The framework uses the opencensus provided opentracing support to record the runtime traces. These can be reported to a trace collector such as Zipkin and visualized.
+
+![Zipkin](https://github.com/mcastelino/testapi/blob/master/documentation/images/zipkin_trace.GIF)
+
+Here you can see the actual accounting of latency across the cluster.
+- Individual busywork computation take 10ms as expected
+- End to end latency
+- Latency across service hops
+- Latency experience by the upstream caller
+
+Note: All this information is also available via openmetrics and can be gathered by prometheus. 
+
+These metrics can also be directly queried from any service directly.
+
+```
+$ curl 192.168.211.4:8887/metrics
+# HELP croot_opencensus_io_http_client_latency Latency distribution of HTTP requests
+# TYPE croot_opencensus_io_http_client_latency histogram
+croot_opencensus_io_http_client_latency_bucket{le="0.0"} 0.0
+croot_opencensus_io_http_client_latency_bucket{le="1.0"} 33787.0
+croot_opencensus_io_http_client_latency_bucket{le="10.0"} 38397.0
+...
+croot_opencensus_io_http_client_latency_bucket{le="13.0"} 38742.0
+croot_opencensus_io_http_client_latency_bucket{le="16.0"} 39511.0
+croot_opencensus_io_http_client_latency_bucket{le="20.0"} 40129.0
+croot_opencensus_io_http_client_latency_bucket{le="25.0"} 41396.0
+...
+croot_opencensus_io_http_client_latency_bucket{le="+Inf"} 41402.0
+croot_opencensus_io_http_client_latency_sum 78679.04198799946
+croot_opencensus_io_http_client_latency_count 41402.0
+# HELP croot_opencensus_io_http_server_latency Latency distribution of HTTP requests
+# TYPE croot_opencensus_io_http_server_latency histogram
+croot_opencensus_io_http_server_latency_bucket{le="0.0"} 0.0
+croot_opencensus_io_http_server_latency_bucket{le="1.0"} 32929.0
+croot_opencensus_io_http_server_latency_bucket{le="2.0"} 38388.0
+...
+croot_opencensus_io_http_server_latency_bucket{le="300.0"} 41402.0
+croot_opencensus_io_http_server_latency_bucket{le="+Inf"} 41402.0
+croot_opencensus_io_http_server_latency_sum 105745.96782699955
+croot_opencensus_io_http_server_latency_count 41402.0
+# HELP croot_prime_latency The distribution of the latencies for prime calculation
+# TYPE croot_prime_latency histogram
+croot_prime_latency_bucket{method="busyHandler",le="1.0"} 0.0
+croot_prime_latency_bucket{method="busyHandler",le="11.0"} 1241.0
+...
+croot_prime_latency_bucket{method="busyHandler",le="+Inf"} 1245.0
+croot_prime_latency_sum{method="busyHandler"} 12621.167159000006
+croot_prime_latency_count{method="busyHandler"} 1245.0
+croot_prime_latency_bucket{method="primeHandler",le="1.0"} 0.0
+croot_prime_latency_bucket{method="primeHandler",le="8.0"} 1427.0
+croot_prime_latency_bucket{method="primeHandler",le="9.0"} 1644.0
+croot_prime_latency_bucket{method="primeHandler",le="10.0"} 1757.0
+...
+croot_prime_latency_bucket{method="primeHandler",le="+Inf"} 1760.0
+croot_prime_latency_sum{method="primeHandler"} 12041.534547999996
+croot_prime_latency_count{method="primeHandler"} 1760.0
+```
+
+
+
+## Higher Level Metrics
+
 Latency of the response at root microservice can be visualized using histograms with the following formulas either using Grafana or Prometheus
+
+![Grafana](https://github.com/mcastelino/testapi/blob/master/documentation/images/grafana_trace.GIF)
+
 
 ```
  histogram_quantile(0.99, sum(rate(root_opencensus_io_http_server_latency_bucket[1m])) by (le))
@@ -165,7 +378,7 @@ To see latencies experienced by the downstream services use the appropriate serv
 
 # Using Kubernetes
 
-We are using [k3s](https://github.com/rancher/k3s/blob/master/README.md) to launch a lightweight Kubernetes cluster. This allows you to seamlessly deploy model latency across a cluster of machines without adding signifant overhead. This also allows you to model noisy neighbour or adding more load to the microservice itself by adding load containers to the POD. This also allows you to constrain the workload's CPU and Memory profile.
+We are using [k3s](https://github.com/rancher/k3s/blob/master/README.md) to launch a lightweight Kubernetes cluster. This allows you to seamlessly deploy model latency across a cluster of machines without adding significant overhead. This also allows you to model noisy neighbour or adding more load to the microservice itself by adding load containers to the POD. This also allows you to constrain the workload's CPU and Memory profile.
 
 > Note: You can use any kubernetes cluster, even an existing working cluster to deploy the service chain.
 
